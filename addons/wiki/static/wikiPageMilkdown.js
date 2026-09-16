@@ -159,6 +159,157 @@ import { extendedImageSchemaPlugin, extendedInsertImageCommand, extendedUpdateIm
 import { linkInputRuleCosutom } from './link.js';
 import { customHeadingIdGenerator } from './heading.js';
 
+const INDEXEDDB_SYNC_TIMEOUT_MS = 800;
+
+function normalizeWikiMarkdown(markdown) {
+    return String(markdown || '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\n+$/g, '');
+}
+
+function isCollabXmlFragmentEmpty(yDoc) {
+    return yDoc.getXmlFragment('prosemirror').length === 0;
+}
+
+function waitForIndexeddbSynced(provider, timeoutMs) {
+    if (!provider || provider.synced) {
+        return Promise.resolve();
+    }
+    return Promise.race([
+        provider.whenSynced.catch(function() {}),
+        new Promise(function(resolve) {
+            setTimeout(resolve, timeoutMs);
+        })
+    ]);
+}
+
+// Attach IndexedDB only after websocket sync.
+// If the live collaborative document already has content, drop stale local
+// ops first so they cannot merge as a duplicate insert.
+async function attachIndexeddbForSession(yDoc, hasRemoteContent) {
+    if (!wikiId) {
+        console.error('Invalid wikiId: it must not be null, undefined, or empty');
+        return null;
+    }
+    if (hasRemoteContent) {
+        try {
+            await yIndexeddb.clearDocument(wikiId);
+        } catch (error) {
+            console.error('Failed to clear the wiki editor cache', error);
+        }
+    }
+    const provider = new yIndexeddb.IndexeddbPersistence(wikiId, yDoc);
+    if (!hasRemoteContent) {
+        await waitForIndexeddbSynced(provider, INDEXEDDB_SYNC_TIMEOUT_MS);
+    }
+    return provider;
+}
+
+var editorTypingAssistArmed = false;
+
+function withEditView(callback) {
+    if (!mEdit || typeof mEdit.action !== 'function') {
+        return null;
+    }
+    var result = null;
+    mEdit.action(function(ctx) {
+        result = callback(ctx, ctx.get(mCore.editorViewCtx));
+    });
+    return result;
+}
+
+function focusEditorForTyping(view) {
+    if (!view) {
+        return;
+    }
+    try {
+        const { TextSelection } = require('prosemirror-state');
+        const selection = TextSelection.atStart(view.state.doc);
+        view.dispatch(view.state.tr.setSelection(selection));
+    } catch (_error) {
+        // Selection restore is best-effort.
+    }
+    view.focus();
+    if (view.dom && typeof view.dom.focus === 'function') {
+        view.dom.focus();
+    }
+}
+
+function isEditorTypingTarget(event) {
+    if (readonly) {
+        return false;
+    }
+    const mEditorEl = document.getElementById('mEditor');
+    if (!mEditorEl || mEditorEl.style.display === 'none') {
+        return false;
+    }
+    const target = event.target;
+    if (!target) {
+        return true;
+    }
+    const tag = target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        return false;
+    }
+    if (typeof target.closest === 'function' && target.closest('.modal')) {
+        return false;
+    }
+    return true;
+}
+
+function onEditorTypingAssistKeyDown(event) {
+    if (!isEditorTypingTarget(event)) {
+        return;
+    }
+    withEditView(function(ctx, view) {
+        if (!view || view.hasFocus()) {
+            return;
+        }
+        // Same idea as toolbar buttons: focus under a real user keypress.
+        focusEditorForTyping(view);
+        if (event.isComposing) {
+            return;
+        }
+        if (event.ctrlKey || event.metaKey || event.altKey) {
+            return;
+        }
+        if (event.key && event.key.length === 1) {
+            event.preventDefault();
+            view.dispatch(view.state.tr.insertText(event.key));
+        }
+    });
+}
+
+function onEditorTypingAssistCompositionStart(event) {
+    if (!isEditorTypingTarget(event)) {
+        return;
+    }
+    withEditView(function(ctx, view) {
+        if (!view || view.hasFocus()) {
+            return;
+        }
+        focusEditorForTyping(view);
+    });
+}
+
+function armEditorTypingAssist() {
+    if (editorTypingAssistArmed) {
+        return;
+    }
+    document.addEventListener('keydown', onEditorTypingAssistKeyDown, true);
+    document.addEventListener('compositionstart', onEditorTypingAssistCompositionStart, true);
+    editorTypingAssistArmed = true;
+}
+
+function disarmEditorTypingAssist() {
+    if (!editorTypingAssistArmed) {
+        return;
+    }
+    document.removeEventListener('keydown', onEditorTypingAssistKeyDown, true);
+    document.removeEventListener('compositionstart', onEditorTypingAssistCompositionStart, true);
+    editorTypingAssistArmed = false;
+}
+
 async function createMView(editor, markdown) {
     if (editor && editor.destroy) {
         editor.destroy();
@@ -229,11 +380,6 @@ async function createMEditor(editor, vm, template) {
         return ret;
     };
 
-    if (!indexeddbProvider && wikiId) {
-        indexeddbProvider = new yIndexeddb.IndexeddbPersistence(wikiId, doc);
-    } else if (!wikiId) {
-        console.error('Invalid wikiId: it must not be null, undefined, or empty');
-    }
     if (!wsProvider) {
         wsProvider = new yWebsocket.WebsocketProvider(wsUrl, docId, doc, { disableBc: true });
     }
@@ -321,6 +467,9 @@ async function createMEditor(editor, vm, template) {
             requestAwarenessRefresh(wsProvider);
             await waitForAwarenessSettlement();
             const preferServerTemplate = !hasOtherAwarenessConnections(wsProvider);
+
+            const hasRemoteContent = !isCollabXmlFragmentEmpty(doc);
+            indexeddbProvider = await attachIndexeddbForSession(doc, hasRemoteContent);
 
             collabService
             .applyTemplate(template, (remoteNode, templateNode) => {
@@ -1129,6 +1278,7 @@ function ViewModel(options){
     self.editMode = function() {
       if(self.canEdit) {
         readonly = false;
+        armEditorTypingAssist();
 
         refreshEditorEditable();
         document.getElementById('mMenuBar').style.display = '';
@@ -1176,6 +1326,7 @@ function ViewModel(options){
         }
 
         readonly = true;
+        disarmEditorTypingAssist();
         refreshEditorEditable();
         document.getElementById('mMenuBar').style.display = 'none';
         document.getElementById('mEditorFooter').style.display = 'none';
@@ -1215,6 +1366,7 @@ function ViewModel(options){
         }
 
         readonly = true;
+        disarmEditorTypingAssist();
 
         document.getElementById('mMenuBar').style.display = 'none';
         document.getElementById('mEditorFooter').style.display = 'none';
